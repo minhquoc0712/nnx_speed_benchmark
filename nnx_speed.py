@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax import linen as nn
+import equinox as eqx
 
 
 # ---------------------------
@@ -78,6 +79,33 @@ class CNNLinen(nn.Module):
         return x
 
 
+# ----------------------------
+# Equinox Version of the Model
+# ----------------------------
+class CNNEquinox(eqx.Module):
+    conv1: eqx.nn.Conv2d
+    conv2: eqx.nn.Conv2d
+    linear1: eqx.nn.Linear
+    linear2: eqx.nn.Linear
+    avg_pool: eqx.nn.AvgPool2d
+
+    def __init__(self, rngs: nnx.Rngs):
+        key1, key2, key3, key4 = jax.random.split(rngs, 4)
+        self.conv1 = eqx.nn.Conv2d(1, 32, kernel_size=(3, 3), padding=1, key=key1)
+        self.conv2 = eqx.nn.Conv2d(32, 64, kernel_size=(3, 3), padding=1, key=key2)
+        self.linear1 = eqx.nn.Linear(3136, 256, key=key3)
+        self.linear2 = eqx.nn.Linear(256, 10, key=key4)
+        self.avg_pool = eqx.nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2))
+
+    def __call__(self, x):
+        x = self.avg_pool(jax.nn.relu(self.conv1(x)))
+        x = self.avg_pool(jax.nn.relu(self.conv2(x)))
+        x = x.reshape(-1)
+        x = jax.nn.relu(self.linear1(x))
+        x = self.linear2(x)
+        return x
+
+
 # ---------------------------
 # Benchmarking Setup
 # ---------------------------
@@ -105,20 +133,23 @@ def benchmark(fn, input_data, num_warmup=10, num_runs=1000, cooldown_time=3):
 
 input_shape = (64, 28, 28, 1)
 dummy_input_jax = jnp.ones(input_shape, dtype=jnp.float32)
-dummy_input_torch = torch.ones((32, 1, 28, 28), dtype=torch.float32)
+dummy_input_torch = torch.ones((64, 1, 28, 28), dtype=torch.float32)
+dummy_input_eqx = jnp.ones((64, 1, 28, 28), dtype=jnp.float32)
 
 # Instantiate models
 rng = jax.random.PRNGKey(0)
 model_nnx = CNNNNX(rngs=nnx.Rngs(rng))
 model_linen = CNNLinen()
 model_pytorch = CNNPyTorch()
+model_eqx = jax.vmap(CNNEquinox(rngs=rng))
 
 # Initialize parameters for Linen
 params_linen = model_linen.init(rng, dummy_input_jax)
 
-# JIT compiled functions (NNX and Linen)
+# JIT compiled functions (NNX, Linen and Equinox)
 model_nnx_jit = nnx.jit(model_nnx)
 model_linen_jit = jax.jit(lambda x: model_linen.apply(params_linen, x))
+model_eqx_jit = jax.jit(model_eqx)
 
 # TorchScript compiled function (PyTorch)
 model_pytorch_scripted = torch.jit.script(model_pytorch)
@@ -131,6 +162,7 @@ for device in ["cpu", "gpu"]:
 
     # Switch to the specified device for JAX (CPU or GPU)
     input_data_jax = jax.device_put(dummy_input_jax, device=jax.devices(device)[0])
+    input_data_eqx = jax.device_put(dummy_input_eqx, device=jax.devices(device)[0])
 
     if device == "cpu":
         # PyTorch CPU device
@@ -141,13 +173,15 @@ for device in ["cpu", "gpu"]:
         model_pytorch.to("cuda")
         input_data_torch = dummy_input_torch.to("cuda")
 
-    # Without JIT (NNX and Linen)
+    # Without JIT (NNX, Linen and Equinox)
     nnx_time = benchmark(model_nnx, input_data_jax)
     linen_time = benchmark(model_linen_jit, input_data_jax)
+    equinox_time = benchmark(model_eqx, input_data_eqx)
 
-    # With JIT (NNX and Linen)
+    # With JIT (NNX, Linen and Equinox)
     nnx_jit_time = benchmark(model_nnx_jit, input_data_jax)
     linen_jit_time = benchmark(model_linen_jit, input_data_jax)
+    equinox_jit_time = benchmark(model_eqx_jit, input_data_eqx)
 
     # PyTorch (without TorchScript)
     torch_time = benchmark(model_pytorch.forward, input_data_torch)
@@ -158,8 +192,10 @@ for device in ["cpu", "gpu"]:
     results = [
         ("NNX (No JIT)", nnx_time),
         ("Linen (No JIT)", linen_time),
+        ("Equinox (No JIT)", equinox_time),
         ("NNX (With JIT)", nnx_jit_time),
         ("Linen (With JIT)", linen_jit_time),
+        ("Equinox (With JIT)", equinox_jit_time),
         ("PyTorch (No TorchScript)", torch_time),
         ("PyTorch (With TorchScript)", torch_scripted_time),
     ]
@@ -167,7 +203,8 @@ for device in ["cpu", "gpu"]:
     use_sort = True
     if use_sort:
         # Sort the results by mean execution time (the first element in the tuple)
-        results = sorted(results, key=lambda x: x[1][0])  # Sort by mean time (x[1][0])
+        # Sort by mean time (x[1][0])
+        results = sorted(results, key=lambda x: x[1][0])
 
     # Print the sorted results
     for model_name, (mean_time, std_time) in results:
